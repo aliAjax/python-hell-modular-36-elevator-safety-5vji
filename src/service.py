@@ -1,9 +1,14 @@
 import hashlib
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from .audit import AuditTrail
 from .domain import ConflictError, NotFoundError, PermissionDenied, ValidationError
 from .rules import RuleEngine
+
+
+def utcnow():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
 class DomainService:
@@ -60,10 +65,20 @@ class DomainService:
         return updated
 
     def merge_offline(self, actor, records):
-        """Merge field records by a stable (source_id, record_id) identity."""
+        """Merge offline field records into their equipment.
+
+        Each record is identified by the stable (source_id, record_id) pair.
+        Re-uploading the same batch (or a failed batch) is a no-op for records
+        that were already merged, so the whole batch can be retried safely.
+
+        Observations are appended to the equipment's ``offline_fields`` log
+        under each field name. The log is append-only: a later record never
+        overwrites an earlier one, and every observation keeps its source and
+        write time (``recorded_at``).
+        """
         if not isinstance(records, list):
             raise ValidationError("records must be a list")
-        created = []
+        merged = []
         for raw in records:
             if not isinstance(raw, dict):
                 raise ValidationError("each offline record must be an object")
@@ -75,7 +90,7 @@ class DomainService:
             entity_id = "offline-" + digest
             existing = self.repository.get_entity(entity_id)
             if existing:
-                created.append(existing)
+                merged.append(existing)
                 continue
             payload = dict(raw)
             self.rules.validate_create(actor, "offline_record", payload, self._lookup)
@@ -86,9 +101,83 @@ class DomainService:
                 payload,
                 actor.user_id,
             )
-            self.audit.record(entity_id, actor, "merge_offline", None, entity["status"], {"source_id": source_id, "record_id": record_id})
-            created.append(entity)
-        return created
+            self.audit.record(
+                entity_id,
+                actor,
+                "merge_offline",
+                None,
+                entity["status"],
+                {
+                    "source_id": source_id,
+                    "record_id": record_id,
+                    "equipment_id": payload.get("equipment_id"),
+                    "record_kind": payload.get("record_kind"),
+                },
+            )
+            merged.append(entity)
+        self._merge_equipment_fields(records)
+        return merged
+
+    def _merge_equipment_fields(self, records):
+        """Append new field observations to each equipment's offline_fields log."""
+        by_equipment = {}
+        for raw in records:
+            source_id = str(raw.get("source_id", "")).strip()
+            record_id = str(raw.get("record_id", "")).strip()
+            equipment_id = str(raw.get("equipment_id", "")).strip()
+            fields = raw.get("fields")
+            if not equipment_id or not isinstance(fields, dict):
+                continue
+            bucket = by_equipment.setdefault(equipment_id, {})
+            for field, value in fields.items():
+                bucket.setdefault(str(field), []).append(
+                    {
+                        "source_id": source_id,
+                        "record_id": record_id,
+                        "value": value,
+                        "recorded_at": str(raw.get("recorded_at", "")),
+                        "merged_at": utcnow(),
+                    }
+                )
+        for equipment_id, field_map in by_equipment.items():
+            self._append_equipment_fields(equipment_id, field_map)
+
+    def _append_equipment_fields(self, equipment_id, field_map, retries=5):
+        """Append observations to the equipment's offline_fields log with retry.
+
+        The log is append-only and keyed by (source_id, record_id), so retrying
+        after a version conflict is safe: already-present observations are kept
+        and only new ones are added.
+        """
+        for attempt in range(retries):
+            equipment = self.repository.get_entity(equipment_id)
+            if not equipment:
+                return
+            current = dict(equipment["data"].get("offline_fields") or {})
+            changed = False
+            for field, observations in field_map.items():
+                log = list(current.get(field) or [])
+                present = {(obs.get("source_id"), obs.get("record_id")) for obs in log}
+                for obs in observations:
+                    key = (obs["source_id"], obs["record_id"])
+                    if key in present:
+                        continue
+                    log.append(obs)
+                    present.add(key)
+                    changed = True
+                current[field] = log
+            if not changed:
+                return
+            merged_data = dict(equipment["data"])
+            merged_data["offline_fields"] = current
+            try:
+                self.repository.update_entity(
+                    equipment_id, equipment["version"], equipment["status"], merged_data
+                )
+                return
+            except ConflictError:
+                if attempt == retries - 1:
+                    raise
 
     def get(self, entity_id):
         entity = self.repository.get_entity(entity_id)

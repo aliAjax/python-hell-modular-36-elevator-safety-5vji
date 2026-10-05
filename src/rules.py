@@ -101,12 +101,44 @@ def _validate_permit(data, lookup):
         raise ValidationError("invalid permit purpose")
 
 
+def _validate_offline_record(data, lookup):
+    source_id = str(data.get("source_id", "")).strip()
+    record_id = str(data.get("record_id", "")).strip()
+    if not source_id or not record_id:
+        raise ValidationError("source_id and record_id are required")
+    equipment_id = str(data.get("equipment_id", "")).strip()
+    if not equipment_id:
+        raise ValidationError("equipment_id is required")
+    if not _find_one(lookup, "equipment", "id", equipment_id):
+        raise ValidationError("offline record requires equipment")
+    record_kind = str(data.get("record_kind", "")).strip()
+    if record_kind not in ("inspection", "maintenance", "alarm"):
+        raise ValidationError("record_kind must be inspection, maintenance, or alarm")
+    fields = data.get("fields")
+    if not isinstance(fields, dict) or not fields:
+        raise ValidationError("fields must be a non-empty object")
+    recorded_at = str(data.get("recorded_at", "")).strip()
+    if not recorded_at:
+        raise ValidationError("recorded_at is required")
+    try:
+        datetime.fromisoformat(recorded_at.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValidationError("recorded_at must be ISO-8601")
+
+
 def _grant_permit(actor, entity, data, lookup):
     equipment = _find_one(lookup, "equipment", "id", entity["data"].get("equipment_id"))
     if not equipment or equipment["status"] not in ("in_service", "suspended"):
         raise ConflictError("permit can only be granted for a serviceable equipment")
     inspections = [i for i in _all(lookup, "inspection") if i["data"].get("equipment_id") == equipment["id"] and i["status"] == "passed"]
-    if not inspections:
+    offline_inspections = [
+        r
+        for r in _all(lookup, "offline_record")
+        if r["data"].get("equipment_id") == equipment["id"]
+        and r["data"].get("record_kind") == "inspection"
+        and str((r["data"].get("fields") or {}).get("result", "")).lower() in ("passed", "pass", "合格")
+    ]
+    if not inspections and not offline_inspections:
         raise ConflictError("permit requires a passed inspection")
     if [r for r in _all(lookup, "remediation") if r["data"].get("equipment_id") == equipment["id"] and r["status"] != "closed"]:
         raise ConflictError("permit blocked by open remediation")
@@ -135,7 +167,7 @@ class RuleEngine:
     INITIAL_STATUS = {
         "equipment": "in_service", "inspection": "scheduled", "maintenance": "planned",
         "alarm": "received", "rescue_job": "dispatched", "remediation": "open",
-        "permit": "blocked",
+        "permit": "blocked", "offline_record": "merged",
     }
     TRANSITIONS = {
         "equipment": {
@@ -184,6 +216,7 @@ class RuleEngine:
         "rescue_job": ("alarm_id", "dedupe_key", "team"),
         "remediation": ("issue", "owner", "due_at"),
         "permit": ("equipment_id", "purpose", "requested_by"),
+        "offline_record": ("source_id", "record_id", "equipment_id", "record_kind", "fields", "recorded_at"),
     }
     ACTION_REQUIRED = {
         ("inspection", "pass"): ("findings",),
@@ -202,6 +235,7 @@ class RuleEngine:
         "rescue_job": ("admin", "dispatcher"),
         "remediation": ("admin", "inspector", "maintenance"),
         "permit": ("admin", "inspector"),
+        "offline_record": ("admin", "inspector"),
     }
     ROLE_ACTIONS = {
         "suspend": ("admin", "inspector"),
@@ -234,6 +268,7 @@ class RuleEngine:
         "rescue_job": lambda a, d, l: _validate_rescue(d, l),
         "remediation": lambda a, d, l: _validate_remediation(d, l),
         "permit": lambda a, d, l: _validate_permit(d, l),
+        "offline_record": lambda a, d, l: _validate_offline_record(d, l),
     }
     CUSTOM_TRANSITIONS = {
         ("permit", "grant"): _grant_permit,

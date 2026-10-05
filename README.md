@@ -34,6 +34,29 @@ curl http://127.0.0.1:8336/health
 - `GET /api/entities/<id>`：读取对象当前版本。
 - `POST /api/entities/<id>/actions`：提交`{"action":"动作名","data":{...},"expected_version":数字}`。
 - `GET /api/audit`：读取审计记录。
+- `POST /api/offline-records`：批量回传手机离线记录，请求体为`{"records":[...]}`。
+
+## 离线记录合并
+
+巡检员在井道等无信号区域先把巡检、维保、困人报警记录在手机上，回到值班室后整批上传。每条记录格式：
+
+```json
+{
+  "source_id": "phone-a",
+  "record_id": "a-0001",
+  "equipment_id": "<设备id，或用asset_no代替>",
+  "category": "inspection | maintenance | alarm",
+  "field": "brake_check",
+  "value": "ok",
+  "recorded_at": "2026-10-05T08:00:00Z"
+}
+```
+
+合并语义：
+
+- 记录按`(source_id, record_id)`幂等：上传失败后整批重传，已合并的记录自动跳过，不会重复写入；同一标识内容不一致时返回冲突错误。
+- 字段合并到对应设备：同一设备同一字段多台手机各记过一次时，先到的写入字段值，后到的不覆盖；所有来源、手机上`recorded_at`的写入时间和回传时间保留在设备`data.offline_entries[字段]`列表里。
+- `category`为`inspection`且`value`为`passed`/`failed`的记录会登记为正式检验台账（标记`source: "offline"`）；整改未关闭时，即使离线检验合格，恢复许可仍会被拒绝。
 
 身份通过`X-User-Id`和`X-Role`请求头传入，角色和动作权限由规则引擎校验。## 核心流程
 
@@ -43,7 +66,7 @@ curl http://127.0.0.1:8336/health
 
 - 同一设备编号不能重复创建；同一设备和故障代码不能同时存在多个未关闭报警。
 - 组件更换维保必须填写`part_serial`。
-- 恢复许可受设备状态、通过检验和未关闭整改共同限制。
+- 恢复许可受设备状态、通过检验和未关闭整改共同限制，离线回传的合格检验也不能绕过未关闭整改。
 
 ## 测试
 

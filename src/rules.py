@@ -101,6 +101,34 @@ def _validate_permit(data, lookup):
         raise ValidationError("invalid permit purpose")
 
 
+OFFLINE_CATEGORIES = ("inspection", "maintenance", "alarm")
+OFFLINE_RESERVED_FIELDS = ("offline_entries",)
+
+
+def _validate_offline_record(data, lookup):
+    category = data.get("category", data.get("record_type"))
+    if category is not None and category not in OFFLINE_CATEGORIES:
+        raise ValidationError("invalid offline record category: " + str(category))
+    equipment = None
+    if data.get("equipment_id"):
+        equipment = _find_one(lookup, "equipment", "id", data.get("equipment_id"))
+    if equipment is None and data.get("asset_no"):
+        equipment = _find_one(lookup, "equipment", "asset_no", data.get("asset_no"))
+    if equipment is None:
+        raise ValidationError("offline record requires a known equipment_id or asset_no")
+    field = str(data.get("field") or "").strip()
+    if not field:
+        raise ValidationError("field is required")
+    if field in OFFLINE_RESERVED_FIELDS:
+        raise ValidationError("field is reserved: " + field)
+    if "value" not in data:
+        raise ValidationError("missing required field: value")
+    try:
+        datetime.fromisoformat(str(data.get("recorded_at")).replace("Z", "+00:00"))
+    except ValueError:
+        raise ValidationError("recorded_at must be ISO-8601")
+
+
 def _grant_permit(actor, entity, data, lookup):
     equipment = _find_one(lookup, "equipment", "id", entity["data"].get("equipment_id"))
     if not equipment or equipment["status"] not in ("in_service", "suspended"):
@@ -130,12 +158,12 @@ class RuleEngine:
     ALIASES = {
         "equipments": "equipment", "inspections": "inspection", "maintenances": "maintenance",
         "alarms": "alarm", "rescue_jobs": "rescue_job", "remediations": "remediation",
-        "permits": "permit",
+        "permits": "permit", "offline_records": "offline_record",
     }
     INITIAL_STATUS = {
         "equipment": "in_service", "inspection": "scheduled", "maintenance": "planned",
         "alarm": "received", "rescue_job": "dispatched", "remediation": "open",
-        "permit": "blocked",
+        "permit": "blocked", "offline_record": "merged",
     }
     TRANSITIONS = {
         "equipment": {
@@ -184,6 +212,7 @@ class RuleEngine:
         "rescue_job": ("alarm_id", "dedupe_key", "team"),
         "remediation": ("issue", "owner", "due_at"),
         "permit": ("equipment_id", "purpose", "requested_by"),
+        "offline_record": ("source_id", "record_id", "field", "recorded_at"),
     }
     ACTION_REQUIRED = {
         ("inspection", "pass"): ("findings",),
@@ -202,6 +231,7 @@ class RuleEngine:
         "rescue_job": ("admin", "dispatcher"),
         "remediation": ("admin", "inspector", "maintenance"),
         "permit": ("admin", "inspector"),
+        "offline_record": ("admin", "inspector", "maintenance"),
     }
     ROLE_ACTIONS = {
         "suspend": ("admin", "inspector"),
@@ -234,6 +264,7 @@ class RuleEngine:
         "rescue_job": lambda a, d, l: _validate_rescue(d, l),
         "remediation": lambda a, d, l: _validate_remediation(d, l),
         "permit": lambda a, d, l: _validate_permit(d, l),
+        "offline_record": lambda a, d, l: _validate_offline_record(d, l),
     }
     CUSTOM_TRANSITIONS = {
         ("permit", "grant"): _grant_permit,
